@@ -1,0 +1,70 @@
+# Dependencies & virtual environments
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# uv (Python package manager)
+uv.lock.bak
+*.whl
+
+# Config with sensitive data (SSH keys, server IPs, credentials)
+config.json
+config.local.json
+config.prod.json
+*.pem
+*.key
+*secret*
+*credential*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# SSH related
+known_hosts
+ssh_config
+*.pub
+
+# MCP specific
+.mcp/
+*.sock

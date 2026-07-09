@@ -1,0 +1,41 @@
+{
+  "bastions": [
+    {
+      "id": "bastion-01",
+      "host": "bastion.example.com",
+      "port": 22,
+      "user": "your_username",
+      "auth_type": "key",
+      "key_path": "~/.ssh/your_key.pem",
+      "password": "",
+      "default": true,
+      "servers": [
+        {
+          "id": "server-01",
+          "name": "应用服务器 1",
+          "search": "/192.168.1.100",
+          "asset_id": "1",
+          "target_dir": "/var/www/app1"
+        },
+        {
+          "id": "server-02",
+          "name": "应用服务器 2",
+          "search": "/192.168.1.101",
+          "asset_id": "2",
+          "target_dir": "/var/www/app2"
+        }
+      ]
+    },
+    {
+      "id": "direct-server",
+      "host": "direct.example.com",
+      "port": 22,
+      "user": "your_username",
+      "auth_type": "password",
+      "key_path": "",
+      "password": "your_password",
+      "default": false,
+      "servers": []
+    }
+  ]
+}

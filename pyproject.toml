@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-ssh"
+version = "1.0.0"
+description = "SSH MCP Server with expect-based JumpServer bastion support and persistent sessions"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "fastmcp>=0.2.0",
+]
+
+[project.scripts]
+mcp-ssh = "mcp_ssh_server:main"
+
+[tool.setuptools]
+py-modules = ["mcp_ssh_server"]
