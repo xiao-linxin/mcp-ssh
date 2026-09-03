@@ -60,6 +60,8 @@ class BastionConfig:
 @dataclass
 class AppConfig:
     bastions: list[BastionConfig]
+    log_enabled: bool = False
+    log_dir: str | None = None
     _path: str | None = None
     _mtime: float = 0
 
@@ -95,6 +97,8 @@ class AppConfig:
             ))
         return cls(
             bastions=bastions,
+            log_enabled=bool(raw.get("log_enabled", False)),
+            log_dir=raw.get("log_dir"),
             _path=str(path),
             _mtime=path.stat().st_mtime,
         )
@@ -407,6 +411,54 @@ class SessionManager:
 
 
 # ---------------------------------------------------------------------------
+# Call logging (按 server_id 隔离)
+# ---------------------------------------------------------------------------
+
+MAX_LOG_RESULT = 102400  # 单条结果最大记录 100KB，避免撑爆磁盘
+
+
+def _log_call(
+    tool: str,
+    server_id: str | None,
+    session_id: str | None,
+    params: dict,
+    result: str,
+    error: str | None = None,
+):
+    """将一次工具调用的 Parameters 与 Result 写入按 server_id 隔离的日志文件。"""
+    if CONFIG is None or not CONFIG.log_enabled or not CONFIG.log_dir:
+        return
+    try:
+        server = server_id or "unknown"
+        log_dir = Path(CONFIG.log_dir) / server
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{datetime.now().strftime('%Y%m%d')}.log"
+
+        entry = {
+            "time": datetime.now().isoformat(),
+            "tool": tool,
+            "server_id": server,
+            "session_id": session_id,
+            "params": params,
+            "result_length": len(result),
+            "success": error is None,
+        }
+        if error:
+            entry["error"] = error
+        if len(result) > MAX_LOG_RESULT:
+            entry["result"] = result[:MAX_LOG_RESULT]
+            entry["result_truncated"] = True
+        else:
+            entry["result"] = result
+
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        # 日志失败不影响主流程
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Stdout reader thread
 # ---------------------------------------------------------------------------
 
@@ -450,7 +502,7 @@ async def ssh_connect(
     try:
         session = _manager.connect_from_config(server_id, timeout)
         bastion, server = CONFIG.find_server(server_id)
-        return (
+        result = (
             f"✅ SSH 连接成功\n\n"
             f"Session ID: {session.id}\n"
             f"Server: {server.name} ({server.id})\n"
@@ -458,7 +510,10 @@ async def ssh_connect(
             f"Target Dir: {server.target_dir}\n"
             f"Created: {session.created_at}"
         )
+        _log_call("ssh_connect", server_id, session.id, {"server_id": server_id, "timeout": timeout}, result)
+        return result
     except Exception as e:
+        _log_call("ssh_connect", server_id, None, {"server_id": server_id, "timeout": timeout}, str(e), error=str(e))
         return f"❌ 连接失败: {e}"
 
 
@@ -485,7 +540,7 @@ async def ssh_connect_raw(
             name=name, proxy=proxy, timeout=timeout,
             auth_type=auth_type, key_path=key_path,
         )
-        return (
+        result = (
             f"✅ SSH 连接成功\n\n"
             f"Session ID: {session.id}\n"
             f"Host: {host}\n"
@@ -495,7 +550,16 @@ async def ssh_connect_raw(
             f"Target Dir: {target_dir}\n"
             f"Created: {session.created_at}"
         )
+        _log_call("ssh_connect_raw", name, session.id, {
+            "host": host, "user": user, "search": search,
+            "server_id": server_id, "target_dir": target_dir, "name": name,
+        }, result)
+        return result
     except Exception as e:
+        _log_call("ssh_connect_raw", name, None, {
+            "host": host, "user": user, "search": search,
+            "server_id": server_id, "target_dir": target_dir, "name": name,
+        }, str(e), error=str(e))
         return f"❌ 连接失败: {e}"
 
 
@@ -506,10 +570,16 @@ async def ssh_execute(
     timeout: Annotated[int, "命令超时毫秒数"] = 15000,
 ) -> str:
     """在已建立的 SSH 会话中执行命令并返回输出。"""
+    server_id = None
+    session = _manager._sessions.get(session_id)
+    if session:
+        server_id = session.server_id
     try:
         output = _manager.execute(session_id, command, timeout)
+        _log_call("ssh_execute", server_id, session_id, {"command": command, "timeout": timeout}, output)
         return f"Session: {session_id}\nCommand: {command}\n\n{output}"
     except Exception as e:
+        _log_call("ssh_execute", server_id, session_id, {"command": command, "timeout": timeout}, str(e), error=str(e))
         return f"❌ 执行失败: {e}"
 
 
@@ -518,10 +588,17 @@ async def ssh_read_output(
     session_id: Annotated[str, "会话 ID（由 ssh_connect 返回）"],
 ) -> str:
     """读取 SSH 会话缓冲区中的最新输出（不发送新命令）。"""
+    server_id = None
+    session = _manager._sessions.get(session_id)
+    if session:
+        server_id = session.server_id
     try:
         output = _manager.read_output(session_id)
-        return output or "(no new output)"
+        result = output or "(no new output)"
+        _log_call("ssh_read_output", server_id, session_id, {"session_id": session_id}, result)
+        return result
     except Exception as e:
+        _log_call("ssh_read_output", server_id, session_id, {"session_id": session_id}, str(e), error=str(e))
         return f"❌ 读取失败: {e}"
 
 
@@ -530,10 +607,16 @@ async def ssh_close(
     session_id: Annotated[str, "要关闭的会话 ID"],
 ) -> str:
     """关闭指定的 SSH 会话。"""
+    server_id = None
+    session = _manager._sessions.get(session_id)
+    if session:
+        server_id = session.server_id
     try:
         result = _manager.close(session_id)
+        _log_call("ssh_close", server_id, session_id, {"session_id": session_id}, result)
         return f"✅ {result}"
     except Exception as e:
+        _log_call("ssh_close", server_id, session_id, {"session_id": session_id}, str(e), error=str(e))
         return f"❌ 关闭失败: {e}"
 
 

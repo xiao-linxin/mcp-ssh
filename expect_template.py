@@ -30,7 +30,8 @@ def build_expect_script(
     parts = [
         "#!/usr/bin/expect -f",
         "",
-        "log_user 1",
+        "# log_user 0: 禁止 expect 自动回显，由长连接循环内 send_user 手动输出，避免双重输出",
+        "log_user 0",
         "",
         f'set HOST "{host}"',
         f'set PORT "{port}"',
@@ -88,10 +89,14 @@ def build_expect_script(
             "",
         ])
 
-    # 公共部分：切换目录 + 就绪标记 + 长连接
+    # 公共部分：切换目录 + 抑制回显/折行 + 就绪标记 + 长连接
     parts.extend([
         "# 切换工作目录",
         'send "cd $TARGET_DIR\\r"',
+        "expect -re {\\$ |# }",
+        "",
+        "# 抑制命令回显并加宽终端，避免 expect 输出被污染",
+        'send "stty -echo 2>/dev/null; stty cols 4096 2>/dev/null\\r"',
         "expect -re {\\$ |# }",
         "",
         "# 输出就绪标记",
