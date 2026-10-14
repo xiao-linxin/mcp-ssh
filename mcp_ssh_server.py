@@ -26,7 +26,8 @@ from fastmcp import FastMCP
 # Constants
 # ---------------------------------------------------------------------------
 
-OUTPUT_MARKER = "__MCP_OUT__"
+OUTPUT_MARKER = "__MCP_OUT__"    # 命令输出结束标记前缀，实际使用 __MCP_OUT__{seq}_
+READY_MARKER = "__MCP_READY__"   # 会话就绪标记，只在连接阶段出现，避免与命令标记混淆
 DEFAULT_TIMEOUT = 30
 
 # ---------------------------------------------------------------------------
@@ -201,12 +202,19 @@ class Session:
     error: str | None
     buffer: str
     lock: threading.Lock
+    cond: threading.Condition     # 与 lock 共用同一把锁：buffer 变化即通知，替代轮询
+    exec_lock: threading.Lock     # 同一会话内命令串行化，防止两条命令互相清空缓冲区
+    seq: int                      # 命令序号，用于生成本次命令的唯一输出标记
     server_id: str       # which configured server this session is for
     created_at: str
     last_activity: str
 
     def touch(self):
         self.last_activity = datetime.now(timezone.utc).isoformat()
+
+    def notify(self):
+        """必须在持有 cond(即 lock) 时调用。"""
+        self.cond.notify_all()
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +275,7 @@ class SessionManager:
                 search=search_str, server_id=server_id, target_dir=target_dir,
                 timeout=timeout, proxy=proxy,
                 auth_type=auth_type, key_path=key_path,
-                marker=OUTPUT_MARKER,
+                marker=READY_MARKER,
             )
             tmp.write(script)
         os.chmod(script_path, 0o755)
@@ -284,13 +292,17 @@ class SessionManager:
             self._next_id += 1
 
         now = datetime.now(timezone.utc).isoformat()
+        lock = threading.Lock()
         session = Session(
             id=sid,
             process=proc,
             status="pending",
             error=None,
             buffer="",
-            lock=threading.Lock(),
+            lock=lock,
+            cond=threading.Condition(lock),
+            exec_lock=threading.Lock(),
+            seq=0,
             server_id=name or sid,
             created_at=now,
             last_activity=now,
@@ -316,58 +328,96 @@ class SessionManager:
         t_err = threading.Thread(target=_stderr_reader, daemon=True)
         t_err.start()
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with session.lock:
+        deadline = time.monotonic() + timeout
+        while True:
+            with session.cond:
                 if session.status == "ready":
                     self._sessions[sid] = session
                     return session
-                if session.status == "error":
+                if session.status in ("error", "closed"):
                     raise RuntimeError(session.error or "Connection failed")
-            time.sleep(0.2)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # reader 线程追加输出/改变状态时会 notify，这里无需轮询
+                session.cond.wait(min(remaining, 0.5))
 
-        with session.lock:
+        with session.cond:
             session.status = "error"
             session.error = f"Connection timeout after {timeout}s"
+            buffer_tail = session.buffer[-200:]
         proc.terminate()
-        raise RuntimeError(f"Connection timeout after {timeout}s. Buffer: {session.buffer[-200:]}")
+        raise RuntimeError(f"Connection timeout after {timeout}s. Buffer: {buffer_tail}")
+
+    def get(self, session_id: str) -> Session | None:
+        return self._sessions.get(session_id)
 
     def execute(self, session_id: str, command: str, timeout_ms: int = 15000) -> str:
         session = self._sessions.get(session_id)
         if not session:
             raise RuntimeError(f"Session {session_id} not found")
-        if session.status == "closed":
-            raise RuntimeError(f"Session {session_id} is closed")
-        if session.status == "error":
-            raise RuntimeError(f"Session {session_id} is in error state: {session.error}")
 
-        with session.lock:
-            session.status = "executing"
-            session.buffer = ""
-        session.touch()
+        # 同一会话内的命令必须串行：并发写 stdin 会互相清空缓冲区，
+        # 导致先到的那条命令永远等不到自己的输出标记（表现为一直卡住）。
+        if not session.exec_lock.acquire(timeout=timeout_ms / 1000 + 5):
+            raise RuntimeError(f"Session {session_id} is busy with another command")
 
-        session.process.stdin.write(f"{command}\necho {OUTPUT_MARKER}\n".encode())
-        session.process.stdin.flush()
+        try:
+            with session.cond:
+                if session.status == "closed":
+                    raise RuntimeError(f"Session {session_id} is closed")
+                if session.status == "error":
+                    raise RuntimeError(f"Session {session_id} is in error state: {session.error}")
 
-        deadline = time.time() + timeout_ms / 1000
-        while time.time() < deadline:
-            with session.lock:
-                if OUTPUT_MARKER in session.buffer:
-                    output = session.buffer.split(OUTPUT_MARKER)[0].strip()
-                    session.status = "output_ready"
-                    session.touch()
-                    return output
-            time.sleep(0.2)
+                # 每次命令用唯一标记，避免上一条超时命令的残留标记被误判为本次结果
+                session.seq += 1
+                marker = f"{OUTPUT_MARKER}{session.seq}_"
+                session.status = "executing"
+                session.buffer = ""
+            session.touch()
 
-        with session.lock:
-            session.status = "ready"
-        return session.buffer.strip() or "(no output, command may still be running)"
+            try:
+                session.process.stdin.write(f"{command}\necho {marker}\n".encode())
+                session.process.stdin.flush()
+            except Exception as exc:
+                with session.cond:
+                    session.status = "error"
+                    session.error = f"stdin write failed: {exc}"
+                    session.notify()
+                raise RuntimeError(f"Session {session_id} write failed: {exc}") from exc
+
+            deadline = time.monotonic() + timeout_ms / 1000
+            while True:
+                with session.cond:
+                    if marker in session.buffer:
+                        output = session.buffer.split(marker, 1)[0].strip()
+                        session.buffer = ""      # 本次输出已消费，避免污染下一条命令
+                        session.status = "ready"
+                        session.touch()
+                        return output
+                    # 进程退出 / 会话被关闭时立刻失败，不再空等到超时
+                    if session.status in ("error", "closed"):
+                        tail = session.buffer.strip()[-500:]
+                        raise RuntimeError(
+                            f"Session {session_id} {session.status}: {session.error or ''} {tail}".strip()
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    session.cond.wait(min(remaining, 0.5))
+
+            with session.cond:
+                session.status = "ready"
+                partial = session.buffer.strip()
+            return partial or "(no output, command may still be running)"
+        finally:
+            session.exec_lock.release()
 
     def read_output(self, session_id: str) -> str:
         session = self._sessions.get(session_id)
         if not session:
             raise RuntimeError(f"Session {session_id} not found")
-        with session.lock:
+        with session.cond:
             out = session.buffer
             session.buffer = ""
         return out
@@ -377,14 +427,19 @@ class SessionManager:
         if not session:
             return f"Session {session_id} not found"
 
+        # 先置位并唤醒：正在 execute 等待的调用方立刻失败退出，而不是等满超时
+        with session.cond:
+            session.status = "closed"
+            session.notify()
+
         try:
             session.process.stdin.write(b"exit\n")
             session.process.stdin.flush()
         except Exception:
             pass
 
-        t0 = time.time()
-        while time.time() - t0 < 3:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3:
             if session.process.poll() is not None:
                 break
             time.sleep(0.2)
@@ -392,19 +447,18 @@ class SessionManager:
             session.process.terminate()
 
         self._sessions.pop(session_id, None)
-        with session.lock:
-            session.status = "closed"
         return f"Session {session_id} closed"
 
     def list_sessions(self) -> list[dict]:
         result = []
-        for sid, s in self._sessions.items():
+        for sid, s in list(self._sessions.items()):
             result.append({
                 "id": sid,
                 "server_id": s.server_id,
                 "status": s.status,
                 "created": s.created_at,
                 "last_activity": s.last_activity,
+                "busy": s.exec_lock.locked(),
                 "error": s.error,
             })
         return result
@@ -470,19 +524,27 @@ def _stdout_reader(session: Session):
             if not line:
                 break
             text = line.decode(errors="replace")
-            with session.lock:
+            with session.cond:
                 session.buffer += text
-                if session.status == "pending" and "Opt>" in text:
-                    session.status = "authenticating"
-                if session.status in ("authenticating", "pending") and OUTPUT_MARKER in text:
-                    session.status = "ready"
-                if session.status in ("authenticating", "pending"):
-                    if "Last login" in session.buffer and re.search(r'\$[ \r]*\n?', session.buffer):
+                if session.status in ("pending", "authenticating"):
+                    if "Opt>" in text:
+                        session.status = "authenticating"
+                    if READY_MARKER in session.buffer:
                         session.status = "ready"
+                    elif "Last login" in session.buffer and re.search(r'[$#][ \r]*\n', session.buffer):
+                        session.status = "ready"
+                session.notify()
+        # 进程退出（EOF）：唤醒所有等待方，避免它们空等到超时
+        with session.cond:
+            if session.status != "closed":
+                session.status = "error"
+                session.error = "expect process exited unexpectedly"
+            session.notify()
     except Exception as exc:
-        with session.lock:
+        with session.cond:
             session.status = "error"
             session.error = str(exc)
+            session.notify()
 
 
 # ---------------------------------------------------------------------------
@@ -492,9 +554,15 @@ def _stdout_reader(session: Session):
 mcp = FastMCP("mcp-ssh")
 _manager = SessionManager()
 
+# 注意：所有工具都用**同步** def 定义，不要改成 async def。
+# FastMCP 对同步函数默认 run_in_thread=True，会放进线程池执行；
+# 而 async def 工具是在事件循环里直接 await 的，内部的阻塞等待
+# （连接、执行命令）会把整个事件循环挂住，多个 AI 对话的请求只能排队，
+# 表现为并发时一直卡住。见 ARCHITECTURE.md「并发与阻塞」。
+
 
 @mcp.tool()
-async def ssh_connect(
+def ssh_connect(
     server_id: Annotated[str, "配置中的服务器 ID（如 dev1-api、dev1-go-mid），见 ssh_list_servers"],
     timeout: Annotated[int, "连接超时秒数"] = DEFAULT_TIMEOUT,
 ) -> str:
@@ -518,7 +586,7 @@ async def ssh_connect(
 
 
 @mcp.tool()
-async def ssh_connect_raw(
+def ssh_connect_raw(
     host: Annotated[str, "堡垒机地址"] = "service.rrzuji.net",
     port: Annotated[int, "堡垒机端口"] = 2222,
     user: Annotated[str, "堡垒机用户名"] = "xiaolinxin",
@@ -564,14 +632,14 @@ async def ssh_connect_raw(
 
 
 @mcp.tool()
-async def ssh_execute(
+def ssh_execute(
     session_id: Annotated[str, "会话 ID（由 ssh_connect 返回）"],
     command: Annotated[str, "要执行的 shell 命令"],
     timeout: Annotated[int, "命令超时毫秒数"] = 15000,
 ) -> str:
     """在已建立的 SSH 会话中执行命令并返回输出。"""
     server_id = None
-    session = _manager._sessions.get(session_id)
+    session = _manager.get(session_id)
     if session:
         server_id = session.server_id
     try:
@@ -584,12 +652,12 @@ async def ssh_execute(
 
 
 @mcp.tool()
-async def ssh_read_output(
+def ssh_read_output(
     session_id: Annotated[str, "会话 ID（由 ssh_connect 返回）"],
 ) -> str:
     """读取 SSH 会话缓冲区中的最新输出（不发送新命令）。"""
     server_id = None
-    session = _manager._sessions.get(session_id)
+    session = _manager.get(session_id)
     if session:
         server_id = session.server_id
     try:
@@ -603,12 +671,12 @@ async def ssh_read_output(
 
 
 @mcp.tool()
-async def ssh_close(
+def ssh_close(
     session_id: Annotated[str, "要关闭的会话 ID"],
 ) -> str:
     """关闭指定的 SSH 会话。"""
     server_id = None
-    session = _manager._sessions.get(session_id)
+    session = _manager.get(session_id)
     if session:
         server_id = session.server_id
     try:
@@ -621,7 +689,7 @@ async def ssh_close(
 
 
 @mcp.tool()
-async def ssh_list_sessions() -> str:
+def ssh_list_sessions() -> str:
     """列出所有当前活跃的 SSH 会话及其状态。"""
     sessions = _manager.list_sessions()
     if not sessions:
@@ -634,6 +702,7 @@ async def ssh_list_sessions() -> str:
         lines.append(f"  Status: {s['status']}")
         lines.append(f"  Created: {s['created']}")
         lines.append(f"  Last Activity: {s['last_activity']}")
+        lines.append(f"  Busy: {'是（正在执行命令）' if s['busy'] else '否'}")
         if s['error']:
             lines.append(f"  Error: {s['error']}")
         lines.append("")
@@ -641,7 +710,7 @@ async def ssh_list_sessions() -> str:
 
 
 @mcp.tool()
-async def ssh_list_servers() -> str:
+def ssh_list_servers() -> str:
     """列出 config.json 中所有可用的服务器配置。"""
     if CONFIG is None:
         return "未找到 config.json"

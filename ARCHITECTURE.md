@@ -155,7 +155,10 @@ Session 数据结构:
 │ buffer: string (stdout 累积)          │
 │ status: pending→ready→executing→...  │
 │ lock: threading.Lock (线程安全)       │
-│ server_id: dev1-api (所属服务器)       │
+│ cond: Condition(lock) (等待/唤醒)     │
+│ exec_lock: Lock (同会话命令串行)       │
+│ seq: int (命令序号 → 唯一输出标记)     │
+│ server_id: dev1-api-49 (所属服务器)    │
 │ created_at / last_activity            │
 └─────────────────────────────────────┘
 ```
@@ -184,28 +187,38 @@ while {1} {
 
 ---
 
-### 3. 并发执行（多 session 独立）
+### 3. 并发执行（多 session / 多 AI 对话互不阻塞）
 
-**能力**：同时连接多台服务器，各自独立互不干扰。
+**能力**：多个 AI 对话同时使用（同一个 MCP 进程）时，各自独立、互不阻塞。
 
-**代码位置**：
+**两级并发模型**：
 
-```
-mcp_ssh_server.py:156-158     # _sessions 字典管理所有 session
-mcp_ssh_server.py:290-295     # session 存入 _sessions
-mcp_ssh_server.py:342-372     # execute 按 session_id 查找
-```
+| 层级 | 隔离单位 | 机制 |
+|------|---------|------|
+| 跨会话（不同 AI 对话） | `session_id` | 每个 session 一个独立的 expect 子进程 + SSH 连接，命令互不影响；工具函数在线程池中执行，不阻塞事件循环 |
+| 会话内（同一 session 上并发调用） | `Session.exec_lock` | 同一会话的命令**串行**执行，配合每次命令唯一标记 `__MCP_OUT__{seq}_`，保证输出不串台 |
 
-**思维**：每个 `server_id` → 一个 expect 子进程 → 一个 SSH 连接。
+**思维**：每个 `server_id` → 一次 `ssh_connect` → 一个 expect 子进程 → 一个 SSH 连接（即一个"通道"）。
 
 ```
 SessionManager._sessions = {
-    session_1: { process: expect_pid_123, server_id: "dev1-api" },
-    session_2: { process: expect_pid_456, server_id: "dev1-go-mid" },
+    session_1: { process: expect_pid_123, server_id: "dev1-api-49" },   ← 对话 A
+    session_2: { process: expect_pid_456, server_id: "dev1-api-49" },   ← 对话 B
 }
 ```
 
-调用 `ssh_execute(session_1, "pwd")` 只发到 session_1 对应的 expect 进程。两个 session 完全独立，可以同时执行命令。
+同一台目标服务器被两个对话使用时，**各自连一个 session**（而不是共用一个 session 抢同一个 shell），
+因此 `cd`、环境变量等 shell 状态互不污染；代价是每个对话各占一条堡垒机连接。
+
+> 结论：`session_id` 本身就是并发隔离的"管道"，不需要再额外引入 channel 概念。
+
+**实测**（真实堡垒机，`sleep 6` 与 `pwd` 并发）：
+
+```
+会话1: sleep 6; echo SLOW_DONE
+会话2: pwd                      → 1.0s 返回（未被 sleep 6 阻塞）
+同会话并发 echo AAA / echo BBB   → 各自拿到自己的输出
+```
 
 ---
 
@@ -266,16 +279,21 @@ config.json:8-10             # auth_type + key_path 配置
 **代码位置**：
 
 ```
-mcp_ssh_server.py:342-372     # execute() 方法
-mcp_ssh_server.py:29          # OUTPUT_MARKER = "__MCP_OUT__"
+mcp_ssh_server.py  execute()   # 命令执行 + 唯一标记检测
+mcp_ssh_server.py  OUTPUT_MARKER = "__MCP_OUT__"    # 命令标记前缀
+mcp_ssh_server.py  READY_MARKER  = "__MCP_READY__"  # 连接就绪标记（避免与命令标记混淆）
 ```
 
-**思维**：发送命令时，在后面追加 `echo __MCP_OUT__`。输出中检测到这个标记时，标记之前的内容就是命令输出。
+**思维**：发送命令时，在后面追加 `echo __MCP_OUT__{seq}_`（`seq` 为该会话的命令序号）。
+输出中出现本次自己的标记时，标记之前的内容就是命令输出。用递增序号而不是固定标记，
+是为了防止"上一条超时命令的残留标记"被当成本次结果。
 
 ```python
-session.process.stdin.write(f"date\necho __MCP_OUT__\n")
-# Python 轮询 buffer，直到发现 "__MCP_OUT__"
-# 按标记分割：buffer.split("__MCP_OUT__")[0]
+session.seq += 1
+marker = f"{OUTPUT_MARKER}{session.seq}_"        # __MCP_OUT__3_
+session.process.stdin.write(f"date\necho {marker}\n".encode())
+# 等待条件变量被唤醒，直到发现 marker
+# 按标记分割：buffer.split(marker, 1)[0]
 ```
 
 ---
@@ -310,6 +328,20 @@ def _stdout_reader(session):
 ### 为什么 stderr 要 DEVNULL？
 
 expect 脚本和 SSH 都可能写 stderr 内容。如果不读取 stderr 管道，它也会满，导致 expect 进程阻塞。直接用 `stderr=subprocess.DEVNULL` 丢弃。
+
+### 为什么多个 AI 对话并发时会一直卡住？（三个坑）
+
+MCP 服务端对每个请求是**并发派发**的（`mcp/server/lowlevel/server.py` 里 `tg.start_soon(self._handle_message, ...)`），
+所以"卡住"不是协议层的问题，而是实现层的三个坑：
+
+| # | 坑 | 后果 | 修法 |
+|:-:|----|------|------|
+| 1 | 工具写成 `async def`，内部却是 `time.sleep()` 轮询 | FastMCP 对 **async 工具直接 `await`**（不走线程池），整个事件循环被挂住 → 所有对话的请求排队等待 | 工具改为**同步 `def`**；FastMCP 默认 `run_in_thread=True`，会放进线程池执行 |
+| 2 | 同一个 session 被并发 `execute`：双方都在开头 `buffer = ""` | 先到的那条命令的输出标记被后到的清掉 → 永远等不到标记，一直等到超时 | `Session.exec_lock` 串行化同一会话的命令 |
+| 3 | `OUTPUT_MARKER` 全局固定 + 轮询 `sleep(0.2)` | 上一条超时命令的残留标记被误判为本次结果；expect 进程退出后等待方要空等满超时 | 每次命令用唯一标记 `__MCP_OUT__{seq}_`；`threading.Condition` 通知取代轮询，进程 EOF / close 立刻置错唤醒 |
+
+> ⚠️ 因此**不要**把 `mcp_ssh_server.py` 里的工具函数改回 `async def`，
+> 除非同时用 `anyio.to_thread.run_sync(...)` 把阻塞逻辑丢进线程池。
 
 ---
 
@@ -360,7 +392,9 @@ execute(session_1, "pwd")
   ├─ session.status = "executing"
   ├─ session.buffer = ""         ← 清空缓冲区
   │
-  ├─ stdin.write("pwd\necho __MCP_OUT__\n")
+  ├─ exec_lock.acquire()          ← 同一会话内命令串行
+  ├─ seq += 1 → marker="__MCP_OUT__4_"
+  ├─ stdin.write("pwd\necho __MCP_OUT__4_\n")
   │   └─ expect 进程收到 stdin
   │
   ├─ expect_user -re "(.*)\n"
@@ -373,14 +407,16 @@ execute(session_1, "pwd")
   │
   ├─ reader 线程: readline() → buffer += "pwd\r\n/xxx/api19\r\n"
   │
-  ├─ expect_user 再匹配 "echo __MCP_OUT__"
-  │   └─ send "echo __MCP_OUT__\r" → SSH
+  ├─ expect_user 再匹配 "echo __MCP_OUT__4_"
+  │   └─ send "echo __MCP_OUT__4_\r" → SSH
   │
-  ├─ spawn 输出 "__MCP_OUT__\r\n"
-  │   └─ reader 线程 buffer += "__MCP_OUT__\r\n"
+  ├─ spawn 输出 "__MCP_OUT__4_\r\n"
+  │   └─ reader 线程 buffer += 该行，并 notify() 唤醒等待方
   │
-  ├─ execute 轮询检测到 buffer 含 "__MCP_OUT__"
-  │   └─ split("__MCP_OUT__")[0] → "pwd\r\n/xxx/api19\r\n"
+  ├─ execute 被唤醒，检测到本次自己的 marker
+  │   └─ split(marker, 1)[0] → "pwd\r\n/xxx/api19\r\n"
+  │   └─ 清空 buffer（本次输出已消费）→ status=ready
+  │   └─ exec_lock.release()
   │   └─ return output
   │
   └─ 返回命令输出
@@ -391,6 +427,7 @@ execute(session_1, "pwd")
 ```
 close(session_1)
   │
+  ├─ status="closed" + notify()   ← 立刻唤醒正在等待输出的 execute
   ├─ stdin.write("exit\n")        ← 优雅退出
   ├─ 等待 3 秒
   ├─ 如果进程没退出 → terminate()
